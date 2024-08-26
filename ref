@@ -1,0 +1,271 @@
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
+
+public class Server implements Runnable {
+
+    private ArrayList<ConnectionHandler> cs;
+    private ServerSocket server;
+    private boolean d;
+    private ExecutorService p;
+    private Integer port = 26525;
+
+    public Server() {
+        cs = new ArrayList<>();
+        d = false;
+    }
+    
+    @Override
+    public void run() {
+        try {
+            server = new ServerSocket(port);
+            p = Executors.newCachedThreadPool();
+            System.out.println("Server initialized.");
+            while (!d) {
+                Socket client = server.accept();
+                ConnectionHandler h = new ConnectionHandler(client);
+                cs.add(h);
+                p.execute(h);
+            }
+        } catch (Exception e) {
+            shutdown();
+        }
+        
+    }
+
+    public void broadcast(String m) {
+        for (ConnectionHandler ch : cs) {
+            if (ch != null) {
+                ch.sendMessage(m);
+            }
+        }
+    }
+
+    public void shutdown() {
+        try {
+            if (!server.isClosed()) {
+                d = true;
+                server.close();
+            }
+            for (ConnectionHandler ch : cs) {
+                ch.shutdown();
+            }
+        } catch (IOException e) {
+            // Ignore
+        }
+    }
+
+    // Implement some method to cleanly destroy previous connection instances.
+
+    class ConnectionHandler implements Runnable {
+
+        private Socket client;
+        private BufferedReader in;
+        private PrintWriter out;
+        private String n;
+
+        private PublicKey puK;
+        private PrivateKey prK;
+        private String cHi;
+        private byte[] cHiB;
+
+        private SecretKey aes;
+
+        public ConnectionHandler(Socket client) {
+            this.client = client;
+        }
+
+        @Override
+        public void run() {
+            try {
+                out = new PrintWriter(client.getOutputStream(), true);
+                in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+                client.setSoTimeout(1000);
+                handshake(in, out);
+                System.out.println("AES Key generated with client: " + Base64.getEncoder().encodeToString(aes.getEncoded()));
+                client.setSoTimeout(0);
+
+                // Login code
+                sendMessage("Nickname: ");
+                n = in.readLine();
+                if (n.isEmpty()) {
+                    out.println("Invalid nickname. Terminating connection.");
+                    shutdown();
+                }
+                try {
+                    byte[] nB = Base64.getDecoder().decode(n);
+                    n = new String(nB);
+                    String[] nArr = n.split(" ");
+
+                    Cipher c = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                    c.init(Cipher.DECRYPT_MODE, aes, new IvParameterSpec(Base64.getDecoder().decode(nArr[0])));
+                    nB = c.doFinal(Base64.getDecoder().decode(nArr[1]));
+                    n = new String(nB);
+                    n.replaceAll(" ", "_");
+                } catch (Exception e) {
+                    System.out.println("Error decrypting initial nickname. Client responded with: " + n);
+                }
+                System.out.println(n + " connected.");
+                broadcast(n + " connected.");
+
+                String msg;
+                while ((msg = in.readLine()) != null) {
+                    // Decrypt message
+                    try {
+                        byte[] msgB = Base64.getDecoder().decode(msg);
+                        msg = new String(msgB);
+                        String[] msgArr = msg.split(" ");
+
+                        Cipher c = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                        c.init(Cipher.DECRYPT_MODE, aes, new IvParameterSpec(Base64.getDecoder().decode(msgArr[0])));
+                        msgB = c.doFinal(Base64.getDecoder().decode(msgArr[1]));
+                        msg = new String(msgB);
+                    } catch (Exception e) {
+                        System.out.println("Error decrypting message. Ended with: " + msg);
+                    }
+
+                    if (msg.startsWith("/nick")) {
+                        String[] msgS = msg.split(" ", 2);
+                        if (msgS.length == 2) {
+                            broadcast(n + " renamed themselves to " + msgS[1]);
+                            System.out.println(n + " renamed themselves to " + msgS[1]);
+                            n = msgS[1];
+                            sendMessage("You are now appearing as: " + n);
+                        } else {
+                            sendMessage("No nickname provided.");
+                        }
+                    } else if (msg.startsWith("/quit")) {
+                        broadcast(n + " left the chat.");
+                        shutdown();
+                    } else {
+                        broadcast(n + ": " + msg);
+                    }
+                }
+            } catch (IOException e) {
+                shutdown();
+            }
+        }
+
+        public void handshake(BufferedReader in, PrintWriter out) {
+            try {
+                KeyPairGenerator gen = KeyPairGenerator.getInstance("RSA");
+                gen.initialize(4096);
+                KeyPair pair = gen.generateKeyPair();
+                puK = pair.getPublic();
+                prK = pair.getPrivate();
+
+                byte[] sRand = new byte[16];
+                byte[] cRand = new byte[16];
+
+                cHi = in.readLine();
+                cHiB = Base64.getDecoder().decode(cHi);
+                cHi = new String(cHiB);
+                if (cHi.startsWith("[CLI-HEL]")) {
+                    System.out.println("Client Hello acknowledged. Data: '" + cHi + "'");
+                    SecureRandom sR = SecureRandom.getInstance("SHA1PRNG");
+                    sR.nextBytes(sRand);
+                    String sHel = "[SER-HEL] " + Base64.getEncoder().encodeToString(sRand) + " " + Base64.getEncoder().encodeToString(puK.getEncoded());
+                    System.out.println("Sending Server Hello. Data: '" + sHel + "'");
+                    String encSHel = Base64.getEncoder().encodeToString(sHel.getBytes());
+                    out.println(encSHel);
+                } else {
+                    System.out.println("Invalid client handshake initialization. Received: '" + cHi + "'\nClosing connection.");
+                    shutdown();
+                }
+
+                cHi = in.readLine();
+                byte[] encB = Base64.getDecoder().decode(cHi);
+                Cipher c = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+                c.init(Cipher.DECRYPT_MODE,prK);
+                byte[] decB = c.doFinal(encB);
+                String decM = new String(decB);
+                if (decM.startsWith("[CLI-RND]")) {
+                    String[] spl = decM.split(" ");
+                    cRand = Base64.getDecoder().decode(spl[1]);
+                    StringBuilder sb = new StringBuilder();
+                    for (byte b : cRand) {
+                        sb.append(String.format("%02x", b));
+                    }
+                    String cRandH = sb.toString();
+                    System.out.println("Client Random acknowledged. Data: '" + cRandH + "'");
+                } else {
+                    System.out.println("Unexpected response to [SER-HEL]. Received: '" + decM + "'");
+                    shutdown();
+                }
+
+                StringBuilder sb = new StringBuilder();
+                for (byte b : cRand) {
+                    sb.append(String.format("%02x", b));
+                }
+                String cRandH = sb.toString();
+                System.out.println("Initializing AES key.");
+
+                SecretKeyFactory skf = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+                PBEKeySpec spec = new PBEKeySpec(cRandH.toCharArray(), sRand, 65537, 256);
+                SecretKey tmp = skf.generateSecret(spec);
+                aes = new SecretKeySpec(tmp.getEncoded(), "AES");
+
+            } catch (Exception e) {
+                // Ignore
+            }
+        }
+
+        public void sendMessage(String msg) {
+            try {
+                byte[] iv = new byte[16];
+                SecureRandom sR = SecureRandom.getInstance("SHA1PRNG");
+                sR.nextBytes(iv);
+                String ivs = Base64.getEncoder().encodeToString(iv);
+
+                Cipher c = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                c.init(Cipher.ENCRYPT_MODE, aes, new IvParameterSpec(iv));
+                byte[] encMsgB = c.doFinal(msg.getBytes());
+                String encMsg = Base64.getEncoder().encodeToString(encMsgB);
+                String ivMsg = Base64.getEncoder().encodeToString((ivs + " " + encMsg).getBytes());
+                out.println(ivMsg);
+            } catch (Exception e) {
+                System.out.println("Something went wrong sending " + msg + " to a client. Closing.");
+                shutdown();
+            }
+        }
+
+        public void shutdown() {
+            try {
+                d = true;
+                p.shutdown();
+                in.close();
+                out.close();
+                if (!client.isClosed()) {
+                    client.close();
+                }
+            } catch (IOException e) {
+                // Ignore
+            }
+        }
+
+    }
+
+    public static void main(String[] args) {
+        Server server = new Server();
+        server.run();
+    }
+
+}
